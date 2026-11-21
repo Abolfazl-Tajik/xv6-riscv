@@ -123,3 +123,15 @@ sys_getprocs(void)
     return -1;
   return procinfo(addr, max);
 }
+
+uint64
+sys_setsched(void)
+{
+  int pid, burst, conf;
+
+  argint(0, &pid);
+  argint(1, &burst);
+  argint(2, &conf);
+
+  return ksetsched(pid, burst, conf);
+}

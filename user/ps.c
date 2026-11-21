@@ -13,20 +13,28 @@ int
 main(int argc, char *argv[])
 {
   int n = getprocs(list, MAXP);
-  if(n < 0){
+  
+  if(n < 0) {
     fprintf(2, "ps: getprocs failed\n");
     exit(1);
   }
 
-  printf("PID\tPPID\tSTATE     SIZE\tNAME\n");
-  for(int i = 0; i < n; i++){
+  printf("PID\tPPID\tSTATE     SIZE\tQ\tWAIT\tBURST\tCONF\tNAME\n");
+  
+  for(int i = 0; i < n; i++) {
     char *s = "???";
+    
     if(list[i].state >= 0 && list[i].state <= 5)
       s = states[list[i].state];
+      
     printf("%d\t%d\t%s", list[i].pid, list[i].ppid, s);
+    
     for(int k = strlen(s); k < 10; k++)
       printf(" ");
-    printf("%d\t%s\n", (int)list[i].sz, list[i].name);
+      
+    printf("%d\t%d\t%d\t%d\t%d\t%s\n", (int)list[i].sz, list[i].queue,
+           list[i].wait, list[i].burst, list[i].confidence, list[i].name);
   }
+  
   exit(0);
 }

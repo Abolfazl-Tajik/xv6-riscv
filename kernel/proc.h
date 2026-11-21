@@ -101,4 +101,12 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // ---- scheduling fields (protected by p->lock) ----
+  int queue;       // MLFQ queue number (1..3)
+  uint qtime;      // tick when the process entered its queue
+  int wait;        // ticks spent waiting while RUNNABLE
+  int burst;       // Time Burst
+  int confidence;  // confidence (0..100)
+  int qticks;      // ticks used of the current quantum/slice
 };

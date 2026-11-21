@@ -15,7 +15,7 @@ struct proc *initproc;
 
 int nextpid = 1;
 struct spinlock pid_lock;
-
+struct spinlock mlfq_lock; //protects process selection in MLFQ
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -52,6 +52,7 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&mlfq_lock,"mlfq");
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -125,6 +126,14 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  // initialize the scheduling fields
+
+  p->queue = (p->pid <= 2) ? 1 : 3; // init and sh start in queue 1
+  p->qtime = ticks;
+  p->wait = 0;
+  p->burst = 2;
+  p->confidence = 50;
+  p->qticks = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -290,6 +299,7 @@ kfork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  
   pid = np->pid;
 
   release(&np->lock);
@@ -419,20 +429,214 @@ kwait(uint64 addr)
   }
 }
 
+// Called on every timer interrupt for the process running on this CPU.
+// Returns 1 if the process must give up the CPU now.
+int
+sched_timer(struct proc *p)
+{
+  int y = 0;
+
+#if defined(SCHEDULER_CFS)
+  int w, ran, total, slice;
+
+  acquire(&p->lock);
+  p->vruntime += (1000 * 1024) / p->weight; // one tick of running time
+  p->qticks++;
+  w = p->weight;
+  ran = p->qticks;
+  release(&p->lock);
+
+  total = cfs_total_weight();
+  if (total < w)
+    total = w;
+  slice = CFS_LATENCY * w / total;
+  if (slice < CFS_MIN_GRAN)
+    slice = CFS_MIN_GRAN;
+  y = (ran >= slice);
+#else
+  acquire(&p->lock);
+  p->qticks++;
+#if defined(SCHEDULER_MLFQ)
+  if (p->queue == 1)
+    y = (p->qticks >= QUANTUM_RR); // round robin
+  else if (p->queue == 2)
+    y = 1;                         // SJF: decide again every tick
+  else
+    y = 0;                         // FCFS: the clock never kicks it out
+#else
+  y = (p->qticks >= QUANTUM_RR);   // plain round robin
+#endif
+  release(&p->lock);
+#endif
+#ifdef SCHED_DEBUG
+  printk("[tick %d] cpu%d pid=%d q=%d ran=%d\n", ticks, cpuid(), p->pid,
+         p->queue, p->qticks);
+#endif
+
+  if (y) {
+    acquire(&p->lock);
+    p->qticks = 0;
+    release(&p->lock);
+  }
+  return y;
+}
+
+// Called once per tick (CPU 0 only) from clockintr().
+// MLFQ: grows the waiting time of RUNNABLE processes and applies aging.
+void
+sched_tick(void)
+{
+#if defined(SCHEDULER_MLFQ)
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      p->wait++;
+      if (p->queue > 1 && p->wait >= AGING_LIMIT) {
+        p->queue--;
+        p->wait = 0;
+        p->qtime = ticks;
+      }
+    }
+    release(&p->lock);
+  }
+#endif
+}
+#if defined(SCHEDULER_MLFQ)
+static int rr_last = NPROC - 1; // index of the last process run from queue 1
+static uint lcg_state = 12345;  // LCG state
+
+// LCG random generator:  x(n+1) = (a*x(n) + c) mod 2^32
+// a = 1664525, c = 1013904223 (Numerical Recipes constants).
+// For a 32-bit uint, "mod 2^32" is just the natural overflow.
+// Low bits of an LCG are not random, so we use the high bits.
+// Returns 0..99. Call only while holding mlfq_lock.
+static uint
+lcg_rand(void)
+{
+  lcg_state = lcg_state * 1664525 + 1013904223;
+  return (lcg_state >> 16) % 100;
+}
+
+// Pick the next process in MLFQ.
+// On success returns p with p->lock held and state RUNNING; else 0.
+static struct proc *
+mlfq_pick(void)
+{
+  struct proc *p;
+  int i, j;
+
+  acquire(&mlfq_lock);
+  
+  // ----- queue 1: round robin (continue after the last one that ran)
+  for (i = 1; i <= NPROC; i++) {
+    p = &proc[(rr_last + i) % NPROC];
+    acquire(&p->lock);
+    
+    if (p->state == RUNNABLE && p->queue == 1) {
+      rr_last = p - proc;
+      goto chosen;
+    }
+    release(&p->lock);
+  }
+  
+  // ----- queue 2: approximate SJF
+  {
+    int idx[NPROC], bst[NPROC], conf[NPROC];
+    int n = 0;
+    
+    // sort the queue-2 processes by Time Burst (small to large)
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      
+      if (p->state == RUNNABLE && p->queue == 2) {
+        j = n++;
+        
+        while (j > 0 && bst[j - 1] > p->burst) {
+          idx[j] = idx[j - 1];
+          bst[j] = bst[j - 1];
+          conf[j] = conf[j - 1];
+          j--;
+        }
+        
+        idx[j] = p - proc;
+        bst[j] = p->burst;
+        conf[j] = p->confidence;
+      }
+      release(&p->lock);
+    }
+    
+    for (i = 0; i < n; i++) {
+      // the last candidate runs without rolling the dice
+      if (i == n - 1 || (int)lcg_rand() <= conf[i]) {
+        p = &proc[idx[i]];
+        acquire(&p->lock);
+        
+        if (p->state == RUNNABLE && p->queue == 2)
+          goto chosen;
+          
+        release(&p->lock);
+        break; // its state changed meanwhile; give up this round
+      }
+    }
+  }
+  
+  // ----- queue 3: FCFS (earliest arrival first)
+  {
+    int best = -1;
+    uint bt = 0;
+    
+    for (i = 0; i < NPROC; i++) {
+      p = &proc[i];
+      acquire(&p->lock);
+      
+      if (p->state == RUNNABLE && p->queue == 3 &&
+          (best < 0 || p->qtime < bt)) {
+        best = i;
+        bt = p->qtime;
+      }
+      release(&p->lock);
+    }
+    
+    if (best >= 0) {
+      p = &proc[best];
+      acquire(&p->lock);
+      
+      if (p->state == RUNNABLE && p->queue == 3)
+        goto chosen;
+        
+      release(&p->lock);
+    }
+  }
+  
+  release(&mlfq_lock);
+  return 0;
+
+chosen:
+  p->state = RUNNING;
+  p->wait = 0;
+  p->qticks = 0;
+  release(&mlfq_lock);
+  return p;
+}
+#endif
+
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
+// Scheduler never returns. It loops, doing:
 //  - choose a process to run.
 //  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
+//  - eventually that process transfers control via swtch back to the scheduler.
 void
 scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
-
+  
   c->proc = 0;
+  
   for (;;) {
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
@@ -442,33 +646,60 @@ scheduler(void)
     intr_on();
     intr_off();
 
+#if defined(SCHEDULER_MLFQ)
+    p = mlfq_pick();
+    if (p) {
+      // p->lock is held and p is already marked RUNNING
+      c->proc = p;
+      swtch(&c->context, &p->context);
+      
+      // Don't re-enable interrupts on release.
+      mycpu()->intena = 0;
+      
+      c->proc = 0;
+      release(&p->lock);
+    } else {
+      // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+    }
+#else
     int found = 0;
+    
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
+      
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
+        // Switch to chosen process. It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        p->qticks = 0;
         c->proc = p;
         swtch(&c->context, &p->context);
-
+        
         // Don't re-enable interrupts on release.
         mycpu()->intena = 0;
-
+        
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
         found = 1;
       }
+      
       release(&p->lock);
     }
+    
     if (found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
+#endif
   }
 }
+
+
+
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
@@ -699,6 +930,7 @@ procdump(void)
     else
       state = "???";
     printk("%d %s %s", p->pid, state, p->name);
+    printk(" q=%d wait=%d", p->queue, p->wait);
     printk("\n");
   }
 }
@@ -715,8 +947,9 @@ procinfo(uint64 addr, int max)
   tmp = (struct pinfo*)kalloc();   
   if(tmp == 0)
     return -1;
+  memset(tmp, 0, PGSIZE);
 
-  for(p = proc; p < &proc[NPROC] && n < max; p++){
+  for(p = proc; p < &proc[NPROC] && n < max && n < PGSIZE / sizeof(struct pinfo); p++){
     acquire(&wait_lock);
     acquire(&p->lock);
     if(p->state != UNUSED){
@@ -725,6 +958,10 @@ procinfo(uint64 addr, int max)
       tmp[n].state = p->state;
       tmp[n].sz = p->sz;
       safestrcpy(tmp[n].name, p->name, sizeof(tmp[n].name));
+      tmp[n].queue = p->queue;
+      tmp[n].wait = p->wait;
+      tmp[n].burst = p->burst;
+      tmp[n].confidence = p->confidence;
       n++;
     }
     release(&p->lock);
@@ -738,4 +975,29 @@ procinfo(uint64 addr, int max)
     return -1;
   }
   return n;
+}
+
+// set the Time Burst and Confidence of a process
+int
+ksetsched(int pid, int burst, int conf)
+{
+  struct proc *p;
+
+  if (burst <= 0 || conf < 0 || conf > 100)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+
+    if (p->state != UNUSED && p->pid == pid) {
+      p->burst = burst;
+      p->confidence = conf;
+      release(&p->lock);
+      return 0;
+    }
+
+    release(&p->lock);
+  }
+
+  return -1;
 }

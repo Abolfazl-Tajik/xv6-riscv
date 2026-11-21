@@ -63,11 +63,19 @@ OBJDUMP = $(TOOLPREFIX)objdump
 # Deterministic builds.
 DETFLAGS = -ffile-prefix-map=$(CURDIR)=.
 
+# choose the scheduler at compile time:  make qemu SCHEDULER=MLFQ   (RR | MLFQ | CFS)
+SCHEDULER ?= RR
+
+
 CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
 CFLAGS += $(DETFLAGS)
 CFLAGS += -march=rv64gc
 CFLAGS += -std=gnu99
 CFLAGS += -MD
+CFLAGS += -DSCHEDULER_$(SCHEDULER)
+ifndef DEBUG
+CFLAGS += -DSCHED_DEBUG
+endif
 CFLAGS += -mcmodel=medany
 CFLAGS += -ffreestanding
 CFLAGS += -fno-common -nostdlib
@@ -153,6 +161,8 @@ UPROGS=\
 	$U/_sync\
 	$U/_ps\
 	$U/_getprocstest\
+	$U/_mlfqtest\
+	$U/_rrtest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

@@ -82,7 +82,8 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  // and the scheduler says this process's turn is over.
+  if (which_dev == 2 && sched_timer(p))
     yield();
 
   prepare_return();
@@ -154,7 +155,7 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  if (which_dev == 2 && myproc() != 0 && sched_timer(myproc()))
     yield();
 
   // the yield() may have caused some traps to occur,
@@ -171,6 +172,7 @@ clockintr()
     ticks++;
     wakeup(&ticks);
     release(&tickslock);
+    sched_tick(); // waiting time and aging
   }
 
   // ask for the next timer interrupt. this also clears
