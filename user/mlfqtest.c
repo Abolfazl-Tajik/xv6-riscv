@@ -16,12 +16,15 @@ show(char *title)
   int n = getprocs(list, MAXP);
   
   printf("---- %s (tick %d) ----\n", title, uptime());
-  printf("PID\tPPID\tSTATE\t\tQ\tWAIT\tBURST\tCONF\tNAME\n");
-  
-  for (int i = 0; i < n; i++)
-    printf("%d\t%d\t%s\t%d\t%d\t%d\t%d\t%s\n", list[i].pid, list[i].ppid,
-           states[list[i].state], list[i].queue, list[i].wait,
+  printf("PID\tPPID\tSTATE     Q\tWAIT\tBURST\tCONF\tNAME\n");
+  for (int i = 0; i < n; i++) {
+    char *s = states[list[i].state];
+    printf("%d\t%d\t%s", list[i].pid, list[i].ppid, s);
+    for (int k = strlen(s); k < 10; k++)
+      printf(" ");
+    printf("%d\t%d\t%d\t%d\t%s\n", list[i].queue, list[i].wait,
            list[i].burst, list[i].confidence, list[i].name);
+  }
 }
 
 // busy loop for `run` ticks; c0 prints a queue table every `step` ticks
@@ -67,7 +70,7 @@ main(int argc, char *argv[])
     
     if (pid == 0) {
       if (i == 0)
-        worker(0, longrun, longrun / 4);
+        worker(0, longrun, longrun / 8);
       else
         worker(i, work, 0);
     }

@@ -14,3 +14,5 @@
 #define USERSTACK   1                 // user stack pages
 #define QUANTUM_RR  5                 // round-robin quantum (ticks)
 #define AGING_LIMIT 800               // aging threshold (ticks)
+#define CFS_LATENCY  12               // scheduling period L (ticks)
+#define CFS_MIN_GRAN 2                // minimum time slice (ticks)

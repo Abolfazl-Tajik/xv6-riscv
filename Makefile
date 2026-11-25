@@ -73,7 +73,7 @@ CFLAGS += -march=rv64gc
 CFLAGS += -std=gnu99
 CFLAGS += -MD
 CFLAGS += -DSCHEDULER_$(SCHEDULER)
-ifndef DEBUG
+ifdef DEBUG
 CFLAGS += -DSCHED_DEBUG
 endif
 CFLAGS += -mcmodel=medany
@@ -163,6 +163,7 @@ UPROGS=\
 	$U/_getprocstest\
 	$U/_mlfqtest\
 	$U/_rrtest\
+	$U/_cfstest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

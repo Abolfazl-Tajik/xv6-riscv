@@ -109,4 +109,9 @@ struct proc {
   int burst;       // Time Burst
   int confidence;  // confidence (0..100)
   int qticks;      // ticks used of the current quantum/slice
+
+  // CFS (protected by p->lock)
+  int nice;          // -20..19
+  int weight;        // derived from nice
+  uint64 vruntime;   // virtual runtime, scaled by 1000
 };

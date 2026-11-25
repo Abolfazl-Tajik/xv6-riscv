@@ -19,6 +19,32 @@ struct spinlock mlfq_lock; //protects process selection in MLFQ
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
+static const int nice_to_weight[40] = {
+  88761, 71755, 56483, 46273, 36291,
+  29154, 23254, 18705, 14949, 11916,
+  9548,  7620,  6100,  4904,  3906,
+  3121,  2501,  1991,  1586,  1277,
+  1024,  820,   655,   526,   423,
+  335,   272,   215,   172,   137,
+  110,   87,    70,    56,    45,
+  36,    29,    23,    18,    15,
+};
+
+uint64 cfs_min_vruntime = 0;
+
+static int
+cfs_weight(int nice)
+{
+  return nice_to_weight[nice + 20];
+}
+
+static void
+cfs_place(struct proc *p)
+{
+  if (p->vruntime < cfs_min_vruntime)
+    p->vruntime = cfs_min_vruntime;
+}
+
 extern char trampoline[]; // trampoline.S
 
 // helps ensure that wakeups of wait()ing
@@ -134,6 +160,9 @@ found:
   p->burst = 2;
   p->confidence = 50;
   p->qticks = 0;
+  p->nice = 0;
+  p->weight = cfs_weight(0);
+  p->vruntime = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -235,6 +264,7 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  cfs_place(p);
   p->state = RUNNABLE;
 
   release(&p->lock);
@@ -309,6 +339,7 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  cfs_place(np);
   np->state = RUNNABLE;
   release(&np->lock);
 
@@ -428,6 +459,24 @@ kwait(uint64 addr)
     acquire(&wait_lock);
   }
 }
+
+#if defined(SCHEDULER_CFS)
+// Sum of weights of all RUNNABLE and RUNNING processes.
+static int
+cfs_total_weight(void)
+{
+  struct proc *p;
+  int sum = 0;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE || p->state == RUNNING)
+      sum += p->weight;
+    release(&p->lock);
+  }
+  return sum;
+}
+#endif
 
 // Called on every timer interrupt for the process running on this CPU.
 // Returns 1 if the process must give up the CPU now.
@@ -622,6 +671,47 @@ chosen:
 }
 #endif
 
+#if defined(SCHEDULER_CFS)
+// Pick the RUNNABLE process with the lowest vruntime
+// mlfq_lock serializes pickers, two CPUs can't take the same process
+static struct proc *
+cfs_pick(void)
+{
+  struct proc *p, *best = 0;
+  uint64 bv = 0;
+
+  acquire(&mlfq_lock);
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNABLE &&
+        (best == 0 || p->vruntime < bv ||
+         (p->vruntime == bv && p->pid < best->pid))) {
+      best = p;
+      bv = p->vruntime;
+    }
+    release(&p->lock);
+  }
+
+  if (best == 0) {
+    release(&mlfq_lock);
+    return 0;
+  }
+
+  acquire(&best->lock);
+  if (best->state != RUNNABLE) {   // changed meanwhile, retry next round
+    release(&best->lock);
+    release(&mlfq_lock);
+    return 0;
+  }
+  best->state = RUNNING;
+  best->qticks = 0;
+  if (best->vruntime > cfs_min_vruntime)
+    cfs_min_vruntime = best->vruntime;
+  release(&mlfq_lock);
+  return best;
+}
+#endif
 
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -660,6 +750,18 @@ scheduler(void)
       release(&p->lock);
     } else {
       // nothing to run; stop running on this core until an interrupt.
+      asm volatile("wfi");
+    }
+#elif defined(SCHEDULER_CFS)
+    p = cfs_pick();
+    if (p) {
+      c->proc = p;
+      swtch(&c->context, &p->context);
+
+      mycpu()->intena = 0;
+      c->proc = 0;
+      release(&p->lock);
+    } else {
       asm volatile("wfi");
     }
 #else
@@ -819,6 +921,7 @@ wakeup(void *chan)
       // If this waiting process has gotten so far as to actually
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
+        cfs_place(p);
         p->state = RUNNABLE;
       }
     }
@@ -842,6 +945,7 @@ kkill(int pid)
     if (p->pid == pid) {
       p->killed = 1;
       if (p->state == SLEEPING) {
+        cfs_place(p);
         // Wake process from sleep().
         p->state = RUNNABLE;
       }
@@ -931,6 +1035,7 @@ procdump(void)
       state = "???";
     printk("%d %s %s", p->pid, state, p->name);
     printk(" q=%d wait=%d", p->queue, p->wait);
+    printk(" nice=%d vrt=%d", p->nice, (int)p->vruntime);
     printk("\n");
   }
 }
@@ -974,6 +1079,7 @@ procinfo(uint64 addr, int max)
     kfree(tmp);
     return -1;
   }
+  kfree(tmp);
   return n;
 }
 
@@ -999,5 +1105,27 @@ ksetsched(int pid, int burst, int conf)
     release(&p->lock);
   }
 
+  return -1;
+}
+
+// Set the nice value of process pid
+int
+ksetnice(int pid, int nice)
+{
+  struct proc *p;
+
+  if (nice < -20 || nice > 19)
+    return -1;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED && p->pid == pid) {
+      p->nice = nice;
+      p->weight = cfs_weight(nice);
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
   return -1;
 }
